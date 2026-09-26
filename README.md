@@ -1,1 +1,1 @@
-This Doom source port is DSDA-Doom plus multiplayer support for tool-assisted speedruns.
+This is **NexusDoom**, a Doom source port derived from _DSDA-Doom_, with network code is copied from _Woof!_. The goal of this source port is to add multiplayer support specifically for tool-assisted speedruns.

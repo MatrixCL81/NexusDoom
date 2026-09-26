@@ -31,6 +31,7 @@
 #include "i_main.h"
 #include "i_system.h"
 #include "lprintf.h"
+#include "m_random.h"
 
 #include "d_net.h"
 #include "net_transport.h"
@@ -102,6 +103,9 @@ static void net_session_build_setup(net_setup_t *setup)
   setup->respawn    = respawnparm;
   setup->longtics   = 0;
   setup->game_speed = dsda_GameSpeed();
+  // Already randomized by the G_ReloadDefaults call before D_InitNetGame.
+  // G_ReloadDefaults leaves it alone from here on while a session is active.
+  setup->rngseed    = rngseed;
 
   // -from_key_frame: send the filename so the client restores from the same file
   memset(setup->from_key_frame, 0, NET_KF_FILENAME_MAX);
@@ -131,6 +135,9 @@ static void net_session_apply_setup(const net_setup_t *setup)
   // Apply host's game speed. Do NOT call dsda_ResetTimeFunctions() here;
   // the MP pacing gate in NetRunOneTic owns throttling for the net loop.
   dsda_UpdateGameSpeed(setup->game_speed);
+  // Host's RNG seed. Without this, each peer seeds from its own clock
+  // and the simulations diverge immediately (complevel 9+).
+  rngseed = setup->rngseed;
 
   // Override client CLI args with host's authoritative values so that
   // downstream code (G_ReloadDefaults, dsda_CompatibilityLevel,

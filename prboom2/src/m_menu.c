@@ -5383,7 +5383,6 @@ static dboolean M_InactiveMenuResponder(int ch, int action, event_t* ev)
   }
 
   if (dsda_InputActivated(dsda_input_speed_down) && !dsda_StrictMode() && (!net_session_active() || net_session.is_host))
-  if (dsda_InputActivated(dsda_input_speed_down))
   {
     int value = StepwiseSum(dsda_GameSpeed(), -1, 3, 10000, 100);
     dsda_UpdateGameSpeed(value);

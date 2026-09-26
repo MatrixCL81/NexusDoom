@@ -51,6 +51,7 @@
 
 #include "doomstat.h"
 #include "d_net.h"
+#include "net_session.h"
 #include "f_finale.h"
 #include "i_video.h"
 #include "m_file.h"
@@ -2871,7 +2872,10 @@ void G_ReloadDefaults(void)
   // killough 3/31/98, 4/5/98: demo sync insurance
   demo_insurance = 0;
 
-  rngseed += I_GetRandomTimeSeed() + gametic; // CPhipps
+  // NexusDoom: in multiplayer the seed comes from the host (net_session.c)
+  // and must not be perturbed by the local clock.
+  if (!net_session_active())
+    rngseed += I_GetRandomTimeSeed() + gametic; // CPhipps
 }
 
 void G_DoNewGame (void)

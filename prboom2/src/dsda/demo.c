@@ -177,8 +177,12 @@ char* dsda_FailedDemoName(void) {
   return dsda_GenerateDemoName(&counter, dsda_failed_demo_name_base);
 }
 
-static int dsda_DemoBufferOffset(void) {
+int dsda_DemoBufferOffset(void) {
   return dsda_demo_write_buffer_p - dsda_demo_write_buffer;
+}
+
+const byte* dsda_GetDemoBuffer(void) {
+  return dsda_demo_write_buffer;
 }
 
 int dsda_BytesPerTic(void) {

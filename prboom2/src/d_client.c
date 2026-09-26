@@ -68,6 +68,8 @@
 #include "m_fixed.h"
 
 #include "dsda/args.h"
+#include "dsda/demo.h"
+#include "dsda/input.h"
 #include "dsda/key_frame.h"
 #include "dsda/settings.h"
 #include "dsda/time.h"
@@ -82,6 +84,65 @@ int solo_net = 0;
 static int remote_maketic;
 
 static int pending_key_frame_op;
+
+// ---------------------------------------------------------------------------
+// Post-rewind self-replay
+//
+// After a rewind or restore, the consoleplayer's ticcmds from the restored
+// point to the pre-rewind point are replayed automatically so the game fast-
+// forwards through the undone segment without live keyboard input.  The
+// lockstep continues unchanged: the replayed cmd is sent to the remote peer
+// each tic and the remote player's new live ticcmds are received as normal.
+// The player presses input_join_demo at any point to take over with live
+// input early.
+// ---------------------------------------------------------------------------
+static byte*        net_replay_buf;
+static const byte*  net_replay_p;
+static const byte*  net_replay_end;
+
+static void NetEndSelfReplay(void)
+{
+  if (net_replay_buf) Z_Free(net_replay_buf);
+  net_replay_buf = NULL;
+  net_replay_p   = NULL;
+  net_replay_end = NULL;
+  SetCustomMessage(displayplayer, "", 0, 0);
+}
+
+static void NetStartSelfReplay(int pre_rewind_offset)
+{
+  int bpt;
+  int stride;
+  int tics;
+  const byte* buf;
+  int local;
+  int t;
+
+  if (!demorecording) {
+    return;
+  }
+
+  bpt    = dsda_BytesPerTic();
+  stride = 2 * bpt; // NexusDoom lockstep is always 2-player
+  tics   = (pre_rewind_offset - dsda_DemoBufferOffset()) / stride;
+  buf    = dsda_GetDemoBuffer();
+  local  = net_session.local_player;
+
+  if (tics <= 0 || !buf) {
+    return;
+  }
+
+  if (net_replay_buf) Z_Free(net_replay_buf);
+  net_replay_buf = (byte*)Z_Malloc(tics * bpt + 1);
+
+  for (t = 0; t < tics; t++) {
+    int src = dsda_DemoBufferOffset() + t * stride + local * bpt;
+    memcpy(net_replay_buf + t * bpt, buf + src, bpt);
+  }
+  net_replay_buf[tics * bpt] = 0x80; // DEMOMARKER
+  net_replay_p   = net_replay_buf;
+  net_replay_end = net_replay_buf + tics * bpt;
+}
 
 static dboolean net_out_of_sync;
 static dboolean net_desync_diag;
@@ -122,8 +183,28 @@ static net_desync_diag_snapshot_t net_diag_local;
 static unsigned int net_diag_last_remote_tic;
 static unsigned int net_diag_last_remote_checksum;
 
+// -netdesyncdiag: log the settings that determine the simulation once per
+// checksum epoch, so the two peers' terminals can be compared line by line.
+static dboolean net_diag_settings_logged;
+
+static void NetLogSimSettings(void)
+{
+  if (!net_desync_diag || net_diag_settings_logged)
+    return;
+
+  net_diag_settings_logged = true;
+  lprintf(LO_INFO,
+          "Net sim settings tic=%d complevel=%d demo_compatibility=%d demo_insurance=%d "
+          "rngseed=%u skill=%d episode=%d map=%d fast=%d respawn=%d nomonsters=%d "
+          "deathmatch=%d consoleplayer=%d\n",
+          gametic, compatibility_level, demo_compatibility, demo_insurance,
+          rngseed, gameskill, gameepisode, gamemap, fastparm, respawnparm,
+          nomonsters, deathmatch, consoleplayer);
+}
+
 static void NetResetChecksumState(void)
 {
+  net_diag_settings_logged = false;
   memset(net_local_checksum_valid, 0, sizeof(net_local_checksum_valid));
   memset(net_remote_checksum_valid, 0, sizeof(net_remote_checksum_valid));
   net_out_of_sync = false;
@@ -345,6 +426,8 @@ static void NetMaybeSendChecksum(void)
   if ((tic % TICRATE) != 0)
     return;
 
+  NetLogSimSettings();
+
   checksum = NetBuildChecksum(tic);
   idx = tic % BACKUPTICS;
 
@@ -388,6 +471,8 @@ static void NetUpdateOutOfSyncMessage(void)
     SetCustomMessage(displayplayer, "waiting for peer", 2 * TICRATE, 0);
   else if (net_out_of_sync)
     SetCustomMessage(displayplayer, "out of sync", 2 * TICRATE, 0);
+  else if (net_replay_p)
+    SetCustomMessage(displayplayer, "replay", 2 * TICRATE, 0);
 }
 
 void D_InitFakeNetGame (void)
@@ -515,8 +600,21 @@ static void NetUpdate(void)
     return;
 
 
-  // Build local ticcmd
-  G_BuildTiccmd(&local_cmds[local][maketic % BACKUPTICS]);
+  // End self-replay when the buffer is exhausted, or when the local player
+  // presses input_join_demo. This only changes where the local ticcmd comes
+  // from, so it needs no network synchronization: the remote peer receives
+  // our ticcmd either way.
+  if (net_replay_p) {
+    if (net_replay_p >= net_replay_end || dsda_InputActive(dsda_input_join_demo)) {
+      NetEndSelfReplay();
+    }
+  }
+
+  // Build local ticcmd — use self-replay buffer when active, else live keyboard.
+  if (net_replay_p) {
+    G_ReadOneTick(&local_cmds[local][maketic % BACKUPTICS], &net_replay_p);
+  } else
+    G_BuildTiccmd(&local_cmds[local][maketic % BACKUPTICS]);
 
   // Host stamps its authoritative game_speed into every ticcmd so the client
   // can update its pacing gate on the exact same execution tic.
@@ -731,15 +829,23 @@ static int NetRunOneTic(void)
       dsda_StoreQuickKeyFrame();
 
     if (combined_op & KF_OP_RESTORE) {
-      dsda_RestoreQuickKeyFrame();
-      NetResetAfterRestore();
-      return 0;
+      if (!net_replay_p) {
+        int pre_rewind_offset = dsda_DemoBufferOffset();
+        dsda_RestoreQuickKeyFrame();
+        NetResetAfterRestore();
+        NetStartSelfReplay(pre_rewind_offset);
+        return 0;
+      }
     }
 
     if (combined_op & KF_OP_REWIND) {
-      dsda_RewindAutoKeyFrame();
-      NetResetAfterRestore();
-      return 0;
+      if (!net_replay_p) {
+        int pre_rewind_offset = dsda_DemoBufferOffset();
+        dsda_RewindAutoKeyFrame();
+        NetResetAfterRestore();
+        NetStartSelfReplay(pre_rewind_offset);
+        return 0;
+      }
     }
   }
 
