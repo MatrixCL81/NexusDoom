@@ -6,6 +6,18 @@ I am a senior full-stack web developer with experience in C# and other languages
 
 I have two GitHub accounts: `github.com/MaartenCL` is my professional account and `github.com/MatrixCL81` my personal account. This repository was originally forked from `github.com/kraflab/dsda-doom` to my professional account, but it has since been transferred to my personal account.
 
+## Golden rule: game mechanics must stay identical to DSDA-Doom
+
+Speedruns are only valid if the game behaves exactly like the original. **Never change how the engine executes a ticcmd:** nothing in the play simulation (`p_*.c`, `m_random.c`, `r_*.c` where it affects gameplay, `G_Ticker`'s command handling, demo encoding/decoding, compatibility levels). Multiplayer code may only:
+
+- decide *which* ticcmds are fed in and *when* (input building, networking, lockstep, key-frame ops, self-replay),
+- read game state (e.g. checksums),
+- make sure both peers feed identical ticcmds and settings into the unchanged engine.
+
+Rounding input to demo precision (`G_NormalizeTiccmd`) is allowed: vanilla Doom does exactly that while recording. It changes the input, not the mechanics. If a change touches anything beyond input and networking, stop and ask the user first.
+
+**How to verify:** build unmodified DSDA-Doom (`/data/repositories/dsda-doom`, the upstream commit NexusDoom branched from) and NexusDoom. Play every demo in `/data/games/doom/replays` in both with `-iwad /data/games/doom/wads/doom.wad -timedemo <demo> -nodraw -nosound -levelstat -analysis`, each in its own working directory with its own `HOME`. The `Timed N gametics` line, `levelstat.txt` and `analysis.txt` must be identical for every demo. Last verified 2026-09-27: all 1,725 demos (1,721 playable, 630 finished levels, 277 NexusDoom multiplayer recordings) were identical.
+
 ## Building
 
 Build out-of-tree against **this** repo's `prboom2/`:
@@ -42,6 +54,7 @@ NexusDoom multiplayer is a small, custom **2-player TCP lockstep** (host = playe
 - `dsda/demo.c/.h`: `dsda_DemoBufferOffset`, `dsda_GetDemoBuffer`, `dsda_BytesPerTic` (used by self-replay). `dsda_InitDemoRecording` doesn't require `-skill` in a netgame.
 - `p_mobj.c`: `P_CountLivingMonsters()` (feeds the desync checksum).
 - `g_game.c` `G_Ticker`: copies `local_cmds[i][gametic % BACKUPTICS]` into `players[i].cmd`. This is where both peers consume the same inputs.
+- `g_game.c` `G_NormalizeTiccmd`: runs a cmd through the lossy demo encode/decode (angleturn → 8 bits without `-longtics`). `NetUpdate` applies it to every live local cmd. **Why:** a recording peer round-trips *every* player's cmd in `G_Ticker` (`G_WriteDemoTiccmd`), so un-normalized cmds from a non-recording peer would execute differently on the two machines → desync as soon as that player turns. `G_BuildTiccmd` also uses its angle-carry logic in MP for the same reason.
 
 ### One lockstep tic (`NetRunOneTic` in `d_client.c`)
 
@@ -59,10 +72,9 @@ The HUD status line (`NetUpdateOutOfSyncMessage`) shows, in priority order: conn
 - **Store/restore:** a quick key frame stored in memory on both peers (identical game state; each peer's own demo buffer).
 - **Rewind:** `dsda_RewindAutoKeyFrame` jumps back to the previous *auto* key frame. Auto key frames are stored every `auto_key_frame_interval` seconds, based on a **local config** value, so both peers must use the same interval and depth.
 - **`-from_key_frame file`:** the host's filename is sent in `SETUP`. Both peers need an identical `.kf` file on disk.
-- **Post-rewind self-replay** (`NetStartSelfReplay` / `NetEndSelfReplay`): after a restore or rewind, each *recording* peer copies its own player's cmds from the restored point up to the pre-rewind point out of its demo buffer. Those cmds then feed `NetUpdate` instead of the keyboard. Pressing `input_join_demo` ends the replay for the local player only. It's handled entirely in `NetUpdate`: nothing is sent over the network, because the replay only changes where the local cmd comes from.
+- **Post-rewind self-replay** (`NetStartSelfReplay` / `NetEndSelfReplay`): after a restore or rewind, each *recording* peer copies its own player's cmds from the restored point up to the pre-rewind point out of its demo buffer. Those cmds then feed `NetUpdate` instead of the keyboard. Restore/rewind always execute on both peers, even mid-replay. A replay still in progress has its unplayed tail appended to the new replay, so it still leads back to the original point. Replayed cmds are zeroed before `G_ReadOneTick`, which only fills demo fields; otherwise stale wire-only fields such as `key_frame_op` would be resent. Pressing `input_join_demo` ends the replay for the local player only. It's handled entirely in `NetUpdate`: nothing is sent over the network, because the replay only changes where the local cmd comes from.
 
 ## Current state / known issues (update as work progresses)
 
-- Committed through `45e2bb756` ("Rewinding also works"). The self-replay feature is **uncommitted** (`d_client.c`, `dsda/demo.c/.h` accessors). It compiles and has not been tested yet.
-- Self-replay only happens when that peer is recording a demo (`demorecording`). While a peer is replaying, its own `RESTORE`/`REWIND` ops are ignored. That decision is based on **local** state, so if only one peer is recording (or replay lengths differ), one peer will rewind and the other won't → desync.
-- Out of sync after two quick rewinds (not yet investigated). Suspects: the gating above, and auto-key-frame settings or wall-clock "slow key framing" timeouts that differ per machine.
+- Self-replay only happens on a peer that is recording a demo (`demorecording`). This is harmless for sync, because replay only changes where the local cmd comes from.
+- Out of sync after two quick rewinds: likely fixed together with the rewind-during-replay desync (restore/rewind used to be skipped on a peer that was still replaying). Needs retesting. If it persists, suspect auto-key-frame settings or the wall-clock "slow key framing" timeout, which differ per machine.

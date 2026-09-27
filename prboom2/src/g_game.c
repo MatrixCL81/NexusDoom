@@ -1093,7 +1093,9 @@ void G_BuildTiccmd(ticcmd_t* cmd)
   cmd->forwardmove += fudgef((signed char)forward);
   cmd->sidemove += side;
 
-  if ((demorecording && !longtics) || shorttics)
+  // NexusDoom: in multiplayer, cmds are always normalized to demo precision
+  // (see G_NormalizeTiccmd), so use the carry logic as if recording.
+  if (((demorecording || net_session_active()) && !longtics) || shorttics)
   {
     // Chocolate Doom Mouse Behaviour
     // Don't discard mouse delta even if value is too small to
@@ -3159,11 +3161,10 @@ void G_ReadOneTick(ticcmd_t* cmd, const byte **data_p)
 /* Demo limits removed -- killough
  * cph - record straight to file
  */
-void G_WriteDemoTiccmd (ticcmd_t* cmd)
+// Encode cmd in demo format into buf (at least 10 bytes); returns the length.
+static int G_EncodeDemoTiccmd(ticcmd_t* cmd, char* buf)
 {
-  char buf[10];
   char *p = buf;
-  const byte* data_p = (byte*)buf;
 
   if (compatibility_level == tasdoom_compatibility)
   {
@@ -3194,8 +3195,33 @@ void G_WriteDemoTiccmd (ticcmd_t* cmd)
 
   dsda_WriteExCmd(&p, cmd);
 
-  dsda_WriteTicToDemo(buf, p - buf);
+  return p - buf;
+}
 
+void G_WriteDemoTiccmd (ticcmd_t* cmd)
+{
+  char buf[10];
+  const byte* data_p = (byte*)buf;
+  int length;
+
+  length = G_EncodeDemoTiccmd(cmd, buf);
+  dsda_WriteTicToDemo(buf, length);
+
+  G_ReadOneTick(cmd, &data_p);
+}
+
+// NexusDoom: apply the same lossy demo round trip as G_WriteDemoTiccmd
+// (e.g. angleturn rounded to 8 bits without -longtics) without recording.
+// In multiplayer every peer normalizes its own cmds before sending them, so
+// a peer that records (and thus round-trips every player's cmd in G_Ticker)
+// executes exactly the same cmds as a peer that doesn't. Wire-only fields
+// (ex.net_game_speed, ex.key_frame_op) are left untouched by G_ReadOneTick.
+void G_NormalizeTiccmd(ticcmd_t* cmd)
+{
+  char buf[10];
+  const byte* data_p = (byte*)buf;
+
+  G_EncodeDemoTiccmd(cmd, buf);
   G_ReadOneTick(cmd, &data_p);
 }
 

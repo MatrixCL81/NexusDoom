@@ -109,6 +109,9 @@ static void NetEndSelfReplay(void)
   SetCustomMessage(displayplayer, "", 0, 0);
 }
 
+// Called after every restore/rewind. If a replay was still in progress, its
+// unplayed tail is appended, so the new replay still leads back to the point
+// the player had originally reached.
 static void NetStartSelfReplay(int pre_rewind_offset)
 {
   int bpt;
@@ -117,10 +120,14 @@ static void NetStartSelfReplay(int pre_rewind_offset)
   const byte* buf;
   int local;
   int t;
+  byte* old_buf;
+  const byte* tail;
+  int tail_len;
+  byte* new_buf;
 
-  if (!demorecording) {
-    return;
-  }
+  old_buf  = net_replay_buf;
+  tail     = net_replay_p;
+  tail_len = tail ? (int)(net_replay_end - tail) : 0;
 
   bpt    = dsda_BytesPerTic();
   stride = 2 * bpt; // NexusDoom lockstep is always 2-player
@@ -128,20 +135,28 @@ static void NetStartSelfReplay(int pre_rewind_offset)
   buf    = dsda_GetDemoBuffer();
   local  = net_session.local_player;
 
-  if (tics <= 0 || !buf) {
-    return;
+  if (!demorecording || tics < 0 || !buf) {
+    tics = 0;
   }
 
-  if (net_replay_buf) Z_Free(net_replay_buf);
-  net_replay_buf = (byte*)Z_Malloc(tics * bpt + 1);
+  new_buf = NULL;
+  if (tics + tail_len > 0) {
+    new_buf = (byte*)Z_Malloc(tics * bpt + tail_len + 1);
 
-  for (t = 0; t < tics; t++) {
-    int src = dsda_DemoBufferOffset() + t * stride + local * bpt;
-    memcpy(net_replay_buf + t * bpt, buf + src, bpt);
+    for (t = 0; t < tics; t++) {
+      int src = dsda_DemoBufferOffset() + t * stride + local * bpt;
+      memcpy(new_buf + t * bpt, buf + src, bpt);
+    }
+    if (tail_len)
+      memcpy(new_buf + tics * bpt, tail, tail_len);
+    new_buf[tics * bpt + tail_len] = 0x80; // DEMOMARKER
   }
-  net_replay_buf[tics * bpt] = 0x80; // DEMOMARKER
-  net_replay_p   = net_replay_buf;
-  net_replay_end = net_replay_buf + tics * bpt;
+
+  if (old_buf) Z_Free(old_buf);
+
+  net_replay_buf = new_buf;
+  net_replay_p   = new_buf;
+  net_replay_end = new_buf ? new_buf + tics * bpt + tail_len : NULL;
 }
 
 static dboolean net_out_of_sync;
@@ -612,9 +627,17 @@ static void NetUpdate(void)
 
   // Build local ticcmd — use self-replay buffer when active, else live keyboard.
   if (net_replay_p) {
+    // G_ReadOneTick only sets the fields stored in the demo. Clear the slot
+    // first so wire-only fields (e.g. a stale key_frame_op from BACKUPTICS
+    // tics ago) are not resent to the remote peer.
+    memset(&local_cmds[local][maketic % BACKUPTICS], 0, sizeof(ticcmd_t));
     G_ReadOneTick(&local_cmds[local][maketic % BACKUPTICS], &net_replay_p);
-  } else
+  } else {
     G_BuildTiccmd(&local_cmds[local][maketic % BACKUPTICS]);
+    // Round to demo precision so recording and non-recording peers execute
+    // identical cmds (replayed cmds come from the demo and already are).
+    G_NormalizeTiccmd(&local_cmds[local][maketic % BACKUPTICS]);
+  }
 
   // Host stamps its authoritative game_speed into every ticcmd so the client
   // can update its pacing gate on the exact same execution tic.
@@ -829,23 +852,19 @@ static int NetRunOneTic(void)
       dsda_StoreQuickKeyFrame();
 
     if (combined_op & KF_OP_RESTORE) {
-      if (!net_replay_p) {
-        int pre_rewind_offset = dsda_DemoBufferOffset();
-        dsda_RestoreQuickKeyFrame();
-        NetResetAfterRestore();
-        NetStartSelfReplay(pre_rewind_offset);
-        return 0;
-      }
+      int pre_rewind_offset = dsda_DemoBufferOffset();
+      dsda_RestoreQuickKeyFrame();
+      NetResetAfterRestore();
+      NetStartSelfReplay(pre_rewind_offset);
+      return 0;
     }
 
     if (combined_op & KF_OP_REWIND) {
-      if (!net_replay_p) {
-        int pre_rewind_offset = dsda_DemoBufferOffset();
-        dsda_RewindAutoKeyFrame();
-        NetResetAfterRestore();
-        NetStartSelfReplay(pre_rewind_offset);
-        return 0;
-      }
+      int pre_rewind_offset = dsda_DemoBufferOffset();
+      dsda_RewindAutoKeyFrame();
+      NetResetAfterRestore();
+      NetStartSelfReplay(pre_rewind_offset);
+      return 0;
     }
   }
 
