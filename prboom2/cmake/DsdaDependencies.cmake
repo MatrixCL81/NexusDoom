@@ -144,5 +144,6 @@ if(WIN32)
     INTERFACE
     winmm
     comctl32
+    ws2_32
   )
 endif()
