@@ -150,7 +150,7 @@ dboolean R_PartialView(void)
 
 dboolean R_StatusBarVisible(void)
 {
-  return R_PartialView() || automap_on;
+  return R_PartialView() || automap_solid;
 }
 
 //
@@ -349,6 +349,10 @@ void R_SetDefaultDrawColumnVars(draw_column_vars_t *dcvars) {
   dcvars->edgeslope = dcvars->drawingmasked = 0;
   dcvars->flags = 0;
 
+  // [AR] mark weapon sprite
+  dcvars->isplayersprite = false;
+  dcvars->pspritepostheight = 0;
+
   // heretic
   dcvars->baseclip = -1;
 }
@@ -544,7 +548,7 @@ void R_FillBackColor (void)
 
 void R_FillBackScreen (void)
 {
-  int automap = automap_on;
+  int automap = automap_solid;
 
   if (grnrock.lumpnum == 0)
     return;

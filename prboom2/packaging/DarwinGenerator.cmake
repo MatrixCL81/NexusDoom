@@ -24,20 +24,34 @@ file(WRITE
   "xattr -dr com.apple.quarantine path/to/folder\n"
 )
 
-find_program(DYLIBBUNDLER_EXECUTABLE
-  NAMES dylibbundler
-  REQUIRED
-)
+if(NOT CPACK_VCPKG_LIBRARY_LINKAGE STREQUAL "static")
+  find_program(DYLIBBUNDLER_EXECUTABLE
+    NAMES dylibbundler
+    REQUIRED
+  )
 
-execute_process(
-  COMMAND ${DYLIBBUNDLER_EXECUTABLE}
-    --bundle-deps
-    --create-dir
-    --overwrite-files
-    --fix-file ${packaged_dir}/nexusdoom
-    --install-path @executable_path/libs_${CPACK_SYSTEM_PROCESSOR}
-    --dest-dir ${packaged_dir}/libs_${CPACK_SYSTEM_PROCESSOR}
-)
+  execute_process(
+    COMMAND ${DYLIBBUNDLER_EXECUTABLE}
+      --bundle-deps
+      --create-dir
+      --overwrite-files
+      --fix-file ${packaged_dir}/nexusdoom
+      --install-path @executable_path/libs_${CPACK_SYSTEM_PROCESSOR}
+      --dest-dir ${packaged_dir}/libs_${CPACK_SYSTEM_PROCESSOR}
+  )
+
+  # SDL3 is loaded dynamically by sdl2-compat, so dylibbundler cannot detect it
+  find_library(SDL3_LIBRARY
+    NAMES SDL3
+    PATHS /opt/homebrew/lib /usr/local/lib
+    NO_DEFAULT_PATH
+  )
+
+  file(COPY_FILE
+    "${SDL3_LIBRARY}"
+    "${packaged_dir}/libs_${CPACK_SYSTEM_PROCESSOR}/libSDL3.dylib"
+  )
+endif()
 
 execute_process(
   COMMAND zip

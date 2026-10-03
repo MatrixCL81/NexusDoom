@@ -21,6 +21,7 @@
 
 #include "doomtype.h"
 #include "doomstat.h"
+#include "d_deh.h"
 #include "g_game.h"
 #include "m_file.h"
 #include "md5.h"
@@ -300,6 +301,9 @@ void dsda_InitDemoRecording(void) {
   // prboom+ has already cached its settings (with demorecording == false)
   // we need to reset things here to satisfy strict mode
   dsda_InitSettings();
+
+  // Update Translucency for Strict Mode
+  deh_changeCompTranslucency();
 
   dsda_LiftInputRestrictions();
   dsda_ResetFeatures();
@@ -811,10 +815,6 @@ void dsda_ApplyDSDADemoFormat(byte** demo_p) {
     if (!mbf21)
       I_Error("You must use complevel 21 when recording in advanced formats.");
 
-    use_dsda_format = true;
-  }
-  else if (dsda_UseMapinfo())
-  {
     use_dsda_format = true;
   }
 
