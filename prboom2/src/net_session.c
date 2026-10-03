@@ -143,13 +143,13 @@ static void net_session_apply_setup(const net_setup_t *setup)
   // downstream code (G_ReloadDefaults, dsda_CompatibilityLevel,
   // dsda_InitGameModifiers, etc.) cannot clobber the host's settings.
 
-  // -complevel
+  // -complevel (a string arg: it also accepts names such as "boom")
   arg = dsda_Arg(dsda_arg_complevel);
-  if (arg->found && arg->value.v_int != setup->complevel)
-    lprintf(LO_WARN, "Ignoring local -complevel %d, using host's %d\n",
-            arg->value.v_int, setup->complevel);
+  if (arg->found && dsda_CompatibilityLevel() != setup->complevel)
+    lprintf(LO_WARN, "Ignoring local -complevel %s, using host's %d\n",
+            arg->value.v_string, setup->complevel);
   snprintf(buf, sizeof(buf), "%d", setup->complevel);
-  dsda_UpdateIntArg(dsda_arg_complevel, buf);
+  dsda_UpdateStringArg(dsda_arg_complevel, buf);
 
   // -skill (CLI is 1-based, startskill is 0-based)
   arg = dsda_Arg(dsda_arg_skill);
