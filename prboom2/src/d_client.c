@@ -44,6 +44,8 @@
 #include <sys/wait.h>
 #endif
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "doomtype.h"
@@ -161,9 +163,40 @@ static void NetStartSelfReplay(int pre_rewind_offset)
 
 static dboolean net_out_of_sync;
 static dboolean net_desync_diag;
+
+// -netframelog <file>: one line per rendered frame and per tic event, for
+// diagnosing render smoothness. Written to a file because it grows quickly.
+// Times are microseconds of dsda_timer_realtime (the pacing gate's clock).
+//   G <t> <gametic> <planned_us>        pacing gate fired, local cmd sent
+//   R <t> <tic>                         remote cmd for <tic> received
+//   T <t> <gametic> <interval_us> <lag_us>  tic executed (gametic is the new
+//                                       value; lag_us = net_render_lag_us)
+//   K <t> <gametic>                     key frame restore/rewind
+//   F <t> <gametic> <frac>              frame rendered with this frac (0..65536)
+static FILE *net_frame_log;
+
+static void NetFrameLog(char type, const char *fmt, ...)
+{
+  va_list args;
+
+  if (!net_frame_log)
+    return;
+
+  fprintf(net_frame_log, "%c %llu ", type, dsda_ElapsedTime(dsda_timer_realtime));
+  va_start(args, fmt);
+  vfprintf(net_frame_log, fmt, args);
+  va_end(args);
+  fputc('\n', net_frame_log);
+
+  if (type != 'F')
+    fflush(net_frame_log);
+}
+
 static dboolean net_waiting_for_peer;
 static dboolean net_connection_lost;
-#define NET_WAIT_INITIAL_TIMEOUT_MS 1000
+// Show "waiting for peer" once the remote cmd is this late; from then on, poll
+// the socket with a timeout instead of spinning the render loop.
+#define NET_WAIT_PEER_MESSAGE_US 1000000ULL
 #define NET_WAIT_POLL_TIMEOUT_MS 50
 static unsigned int net_local_checksum_tic[BACKUPTICS];
 static unsigned int net_local_checksum_value[BACKUPTICS];
@@ -234,13 +267,61 @@ static void NetResetChecksumState(void)
 // allowed to fire. Zero means "not yet armed" — gate initialises on first use.
 static unsigned long long net_pacing_next_tic_us = 0;
 
-// Network-derived interpolation fraction for the renderer. Updated each frame
-// by the pacing gate so I_GetTimeFrac() can bypass the wall clock in MP.
-static fixed_t net_interpolation_frac = FRACUNIT;
+// The pacing gate has fired for gametic and the local cmd is sent. The tic
+// waits for the remote cmd and then for its execution time (see below) without
+// blocking, so frames keep being rendered in the meantime.
+static dboolean net_tic_due;
+static unsigned long long net_tic_due_plan_us; // when the gate was scheduled to fire
+static dboolean net_tic_ready;                 // remote cmd arrived, exec time known
+static unsigned long long net_tic_exec_us;
 
+// Render clock. Interpolation only works if tics execute at evenly spaced
+// times, but the remote cmd arrives some time after our gate fires: the phase
+// offset between the two peers' gates, network latency and the other peer's
+// frame rate all add to that, and vary from tic to tic. So each tic executes at its planned gate time plus
+// net_render_lag_us, the largest recent delay. The delay rises at once to any
+// new maximum (the view freezes once, for the difference) and decays slowly
+// (the view runs imperceptibly fast while it does), so it neither jumps nor
+// keeps adding latency after a single hiccup.
+static dboolean net_render_base_valid;
+static unsigned long long net_render_base_us; // execution time of the latest tic
+static unsigned long long net_render_lag_us;
+
+static unsigned long long NetTicIntervalUs(void)
+{
+  int speed = dsda_GameSpeed();
+
+  if (speed <= 0) speed = 100;
+  // interval_us = 1 / (TICRATE * speed/100)  expressed in microseconds
+  return (unsigned long long)1000000ULL * 100 / (35 * speed);
+}
+
+static void NetResetRenderClock(void)
+{
+  net_tic_due = false;
+  net_tic_ready = false;
+  net_render_base_valid = false;
+  net_render_lag_us = 0;
+}
+
+// Called by I_GetTimeFrac() once per rendered frame, so the fraction reflects
+// the moment of rendering rather than the moment the pacing gate last ran.
 fixed_t NetGetTimeFrac(void)
 {
-  return net_interpolation_frac;
+  fixed_t frac = FRACUNIT;
+
+  if (net_render_base_valid) {
+    unsigned long long now = dsda_ElapsedTime(dsda_timer_realtime);
+    unsigned long long interval_us = NetTicIntervalUs();
+
+    if (now <= net_render_base_us)
+      frac = 0;
+    else if (now - net_render_base_us < interval_us)
+      frac = (fixed_t)((now - net_render_base_us) * FRACUNIT / interval_us);
+  }
+
+  NetFrameLog('F', "%d %d", gametic, frac);
+  return frac;
 }
 
 // Purge all per-session multiplayer state. Called on game init and on every
@@ -249,7 +330,7 @@ void NetResetState(void)
 {
   remote_maketic = 0;
   net_pacing_next_tic_us = 0;
-  net_interpolation_frac = FRACUNIT;
+  NetResetRenderClock();
   NetResetChecksumState();
 }
 
@@ -261,7 +342,7 @@ static void NetResetAfterRestore(void)
   maketic = gametic;
   remote_maketic = gametic;
   net_pacing_next_tic_us = 0;
-  net_interpolation_frac = FRACUNIT;
+  NetResetRenderClock();
   NetResetChecksumState();
 }
 
@@ -515,6 +596,16 @@ void D_InitNetGame(void)
   arg_join = dsda_Arg(dsda_arg_join);
   arg_port = dsda_Arg(dsda_arg_port);
   net_desync_diag = dsda_Flag(dsda_arg_netdesyncdiag);
+  {
+    dsda_arg_t *arg_frame_log = dsda_Arg(dsda_arg_netframelog);
+
+    if (arg_frame_log->found && !net_frame_log) {
+      net_frame_log = fopen(arg_frame_log->value.v_string, "w");
+      if (!net_frame_log)
+        lprintf(LO_ERROR, "Cannot open -netframelog file %s\n",
+                arg_frame_log->value.v_string);
+    }
+  }
   port = NET_DEFAULT_PORT;
 
   if (arg_port->found)
@@ -665,8 +756,10 @@ static void NetUpdate(void)
   maketic++;
 }
 
-// Receive remote player's ticcmd for the given tic.
-// Blocks until data arrives (hard stall). Returns 0 on success, -1 on error.
+// Receive remote player's ticcmd for gametic. Doesn't block, so the caller
+// can keep rendering while the cmd is underway (only polls with a timeout once
+// the peer is so late that "waiting for peer" is shown).
+// Returns 0 on success, 1 if the cmd hasn't arrived yet, -1 on error.
 static int NetRecvRemoteTic(void)
 {
   unsigned char buf[64];
@@ -675,16 +768,17 @@ static int NetRecvRemoteTic(void)
   int remote = net_session.remote_player;
 
   while (remote_maketic <= gametic) {
-    int timeout_ms = net_waiting_for_peer ? NET_WAIT_POLL_TIMEOUT_MS : NET_WAIT_INITIAL_TIMEOUT_MS;
+    int timeout_ms = net_waiting_for_peer ? NET_WAIT_POLL_TIMEOUT_MS : 0;
     int wait_result = net_wait_for_packet(net_session.socket, timeout_ms);
 
     if (wait_result == 0) {
-      if (!net_waiting_for_peer) {
+      if (!net_waiting_for_peer &&
+          dsda_ElapsedTime(dsda_timer_realtime) - net_tic_due_plan_us >= NET_WAIT_PEER_MESSAGE_US) {
         lprintf(LO_INFO, "NetRecvRemoteTic: waiting for remote tic %d\n", gametic);
+        net_waiting_for_peer = true;
+        NetUpdateOutOfSyncMessage();
       }
 
-      net_waiting_for_peer = true;
-      NetUpdateOutOfSyncMessage();
       return 1;
     }
 
@@ -700,6 +794,7 @@ static int NetRecvRemoteTic(void)
 
     if (msg_type == NET_MSG_TICCMD) {
       net_read_ticcmd(buf, &local_cmds[remote][remote_maketic % BACKUPTICS]);
+      NetFrameLog('R', "%d", remote_maketic);
       remote_maketic++;
       net_waiting_for_peer = false;
     }
@@ -755,40 +850,28 @@ static int NetRunOneTic(void)
   // this function, touching no global time accumulator. This avoids the
   // catch-up burst that occurs when the global clock is compared against wall
   // time accumulated during the handshake/connection phase.
+  //
+  // Once the gate has fired, the tic stays due until it executes; later calls
+  // skip straight to receiving the remote cmd.
   // ---------------------------------------------------------------------------
-  {
-    int speed = dsda_GameSpeed();
+  if (!net_tic_due) {
     unsigned long long now = dsda_ElapsedTime(dsda_timer_realtime);
-    unsigned long long interval_us;
-
-    if (speed <= 0) speed = 100;
-    // interval_us = 1 / (TICRATE * speed/100)  expressed in microseconds
-    interval_us = (unsigned long long)1000000ULL * 100 / (35 * speed);
+    unsigned long long interval_us = NetTicIntervalUs();
 
     if (net_pacing_next_tic_us == 0)
       net_pacing_next_tic_us = now; // first tic: arm the gate without waiting
 
     if (now < net_pacing_next_tic_us)
     {
-      // Not yet time for the next tic. Compute the interpolation fraction
-      // representing how far we are through the current interval.
-      unsigned long long elapsed, wait_us;
-      fixed_t frac;
+      // Not yet time for the next tic. Sleep in small chunks so input and
+      // menus stay responsive, then yield so a frame can be rendered.
+      unsigned long long wait_us = net_pacing_next_tic_us - now;
 
-      elapsed = now - (net_pacing_next_tic_us - interval_us);
-      frac = (fixed_t)(elapsed * FRACUNIT / interval_us);
-      net_interpolation_frac = BETWEEN(0, FRACUNIT, frac);
-
-      // Sleep in small chunks so input and menus stay responsive, then yield.
-      wait_us = net_pacing_next_tic_us - now;
       if (wait_us > 5000) wait_us = 5000;
       I_uSleep((unsigned long)wait_us);
       M_Ticker();
       return 0;
     }
-
-    // Tic is about to fire — fraction is complete.
-    net_interpolation_frac = FRACUNIT;
 
     // Advance the schedule by exactly one interval from the *planned* time so
     // the cadence stays accurate. If we have fallen more than one interval
@@ -797,14 +880,21 @@ static int NetRunOneTic(void)
     net_pacing_next_tic_us += interval_us;
     if (net_pacing_next_tic_us < now)
       net_pacing_next_tic_us = now + interval_us;
+    net_tic_due_plan_us = net_pacing_next_tic_us - interval_us;
+    net_tic_due = true;
+    NetFrameLog('G', "%d %llu", gametic, net_tic_due_plan_us);
+
+    I_StartTic();
+
+    // Build local ticcmd and send to remote
+    NetUpdate();
+    if (!net_session_active())
+      return -1;
   }
-
-  I_StartTic();
-
-  // Build local ticcmd and send to remote
-  NetUpdate();
-  if (!net_session_active())
-    return -1;
+  else if (net_waiting_for_peer) {
+    // Long stall: keep processing events so the menu stays usable.
+    I_StartTic();
+  }
 
   // Wait for remote ticcmd
   {
@@ -821,7 +911,45 @@ static int NetRunOneTic(void)
       return -1;
   }
 
-  // Both players have ticcmds for gametic — advance one tic
+  // Both players have ticcmds for gametic. Hold the tic until its execution
+  // time on the render clock, rendering frames in the meantime.
+  {
+    unsigned long long now = dsda_ElapsedTime(dsda_timer_realtime);
+
+    if (!net_tic_ready) {
+      unsigned long long interval_us = NetTicIntervalUs();
+      unsigned long long lag_us = now - net_tic_due_plan_us;
+
+      if (lag_us >= interval_us) {
+        // A stall (e.g. the peer finished its screen wipe later), not a
+        // steady delay that holding tics could smooth out.
+        net_tic_exec_us = now;
+      }
+      else {
+        unsigned long long decay_us = interval_us / 64;
+
+        net_render_lag_us =
+            net_render_lag_us > decay_us ? net_render_lag_us - decay_us : 0;
+        if (lag_us > net_render_lag_us)
+          net_render_lag_us = lag_us;
+        // Holding a tic past the next gate time would delay our next cmd and
+        // make the peer wait for us in turn.
+        if (net_render_lag_us > interval_us - interval_us / 8)
+          net_render_lag_us = interval_us - interval_us / 8;
+        net_tic_exec_us = net_tic_due_plan_us + net_render_lag_us;
+      }
+      net_tic_ready = true;
+    }
+
+    if (now < net_tic_exec_us) {
+      M_Ticker();
+      return 0;
+    }
+
+    net_tic_due = false;
+    net_tic_ready = false;
+    net_render_base_us = net_tic_exec_us;
+  }
 
   // Synchronize game_speed from the host's ticcmd. Both peers apply this on
   // the same execution tic (host and client both possess the host's ticcmd for
@@ -855,6 +983,7 @@ static int NetRunOneTic(void)
       int pre_rewind_offset = dsda_DemoBufferOffset();
       dsda_RestoreQuickKeyFrame();
       NetResetAfterRestore();
+      NetFrameLog('K', "%d", gametic);
       NetStartSelfReplay(pre_rewind_offset);
       return 0;
     }
@@ -863,6 +992,7 @@ static int NetRunOneTic(void)
       int pre_rewind_offset = dsda_DemoBufferOffset();
       dsda_RewindAutoKeyFrame();
       NetResetAfterRestore();
+      NetFrameLog('K', "%d", gametic);
       NetStartSelfReplay(pre_rewind_offset);
       return 0;
     }
@@ -876,14 +1006,27 @@ static int NetRunOneTic(void)
   if (!net_session_active())
     return -1;
   gametic++;
-  // Reset to 0 so the first rendered frame after the tic fires starts at the
-  // beginning of the new interval (frac=0 = prev_viewangle = pre-turn state).
-  // This mirrors the vanilla wall-clock path where dsda_TickElapsedTime()
-  // returns ~0 immediately after a tic, giving visual continuity without the
-  // FRACUNIT-then-near-0 snap that caused the one-frame overshoot.
-  net_interpolation_frac = 0;
+  net_render_base_valid = true;
+  NetFrameLog('T', "%d %llu %llu", gametic, NetTicIntervalUs(), net_render_lag_us);
   NetUpdateOutOfSyncMessage();
   return 1;
+}
+
+// Run the tics that are due before the next frame: usually at most one, but a
+// peer whose frames take longer than a tic (e.g. 35 fps at full game speed)
+// catches up by running several, instead of slowing down both players.
+#define NET_MAX_TICS_PER_FRAME 4
+
+static void NetRunDueTics(void)
+{
+  int i;
+
+  for (i = 0; i < NET_MAX_TICS_PER_FRAME; i++) {
+    if (NetRunOneTic() != 1)
+      return;
+    if (dsda_ElapsedTime(dsda_timer_realtime) < net_pacing_next_tic_us)
+      return;
+  }
 }
 
 // Implicitly tracked whenever we check the current tick
@@ -895,7 +1038,7 @@ void TryRunTics (void)
   int entertime = dsda_GetTick();
 
   if (net_session_active()) {
-    NetRunOneTic();
+    NetRunDueTics();
     return;
   }
 

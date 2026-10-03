@@ -20,6 +20,7 @@
 
 #include "i_system.h"
 #include "lprintf.h"
+#include "net_session.h"
 
 #include "dsda/args.h"
 #include "dsda/configuration.h"
@@ -109,8 +110,12 @@ void dsda_LimitFPS(void) {
   int fps_limit;
 
   allow_limit = (movement_smooth || !window_focused) && !dsda_Flag(dsda_arg_timedemo) && !dsda_Flag(dsda_arg_fastdemo);
-  fps_limit = window_focused ? dsda_IntConfig(dsda_config_fps_limit)
-                             : dsda_IntConfig(dsda_config_background_fps_limit);
+  // In multiplayer the other player waits for this peer's tics, and a peer
+  // with a low frame rate makes their view stutter (and at 35 fps or less can
+  // slow the game down), so a background window must not be throttled.
+  fps_limit = window_focused || net_session_active()
+            ? dsda_IntConfig(dsda_config_fps_limit)
+            : dsda_IntConfig(dsda_config_background_fps_limit);
 
   if (allow_limit && fps_limit) {
     unsigned long long target_time;

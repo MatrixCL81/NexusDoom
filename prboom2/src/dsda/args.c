@@ -218,6 +218,11 @@ static arg_config_t arg_config[dsda_arg_count] = {
     "enable verbose multiplayer desync diagnostics",
     arg_null,
   },
+  [dsda_arg_netframelog] = {
+    "-netframelog", NULL, NULL,
+    "write multiplayer frame and tic timing to the given file",
+    arg_string,
+  },
   [dsda_arg_pistol_start] = {
     "-pistolstart", "-wandstart", NULL,
     "automatically pistol start each map",

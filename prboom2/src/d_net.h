@@ -56,8 +56,9 @@ void NetSingleTic(void);
 // Called on disconnect and at game init so reconnects start with a clean slate.
 void NetResetState(void);
 
-// Return the network pacing gate's interpolation fraction for the renderer.
-// Only meaningful when net_session_active() is true.
+// Return the renderer's interpolation fraction, measured from when the latest
+// tic was executed rather than from the wall clock. Only meaningful when
+// net_session_active() is true.
 fixed_t NetGetTimeFrac(void);
 
 // Queue a key frame operation (KF_OP_STORE / KF_OP_RESTORE) to be stamped

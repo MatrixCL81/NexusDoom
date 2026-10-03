@@ -153,6 +153,7 @@ typedef enum {
   dsda_arg_join,
   dsda_arg_port,
   dsda_arg_netdesyncdiag,
+  dsda_arg_netframelog,
   dsda_arg_count,
 } dsda_arg_identifier_t;
 

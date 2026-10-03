@@ -125,9 +125,8 @@ fixed_t I_GetTimeFrac (void)
 {
   fixed_t frac;
 
-  // In multiplayer, use the network pacing gate's fraction directly.
-  // The global wall clock desyncs from the lockstep cadence after speed
-  // changes or thread freezes, so we bypass it entirely.
+  // In multiplayer, tics run when the peer's cmd arrives, not on the global
+  // wall clock, so the fraction comes from the lockstep loop's render clock.
   if (net_session_active())
     return NetGetTimeFrac();
 
