@@ -29,6 +29,8 @@ def analyze(path, skip_us, dump):
             if first_t is None:
                 first_t = t
             if t - first_t < skip_us:
+                if kind == 'T':
+                    interval = int(parts[3])  # the tic length still applies afterwards
                 continue
             if kind == 'G':
                 last_gate_t = t

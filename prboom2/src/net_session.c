@@ -13,13 +13,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <winsock2.h>
-#else
-  #include <sys/select.h>
-  #include <sys/time.h>
-#endif
 
 #include "doomstat.h"
 #include "d_main.h"
@@ -65,8 +58,6 @@ static void net_sigint_handler(int sig)
 }
 
 net_session_t net_session;
-
-static int server_socket = -1;
 
 static void net_session_reset(void)
 {
@@ -206,93 +197,122 @@ static void net_session_apply_setup(const net_setup_t *setup)
   }
 }
 
+// Wait until Ctrl-C or a datagram (at most timeout_ms). Exits on Ctrl-C.
+static int net_session_wait(int sock, int timeout_ms, void (*prev_sigint)(int),
+                            const char *what)
+{
+  if (net_interrupted) {
+    lprintf(LO_INFO, "Interrupted, aborting %s.\n", what);
+    signal(SIGINT, prev_sigint);
+    if (net_session.socket == sock)
+      net_session_disconnect();
+    else
+      net_close(sock);
+    I_SafeExit(0);
+  }
+
+  return net_wait_for_packet(sock, timeout_ms);
+}
+
 int net_session_host_start(int port)
 {
   net_setup_t setup;
-  unsigned char buf[NET_SETUP_SIZE + NET_HEADER_SIZE];
+  unsigned char buf[NET_MAX_PACKET];
+  unsigned char setup_buf[NET_SETUP_SIZE];
+  int setup_len;
   int len;
-  int client_sock;
+  int sock;
   int msg_type;
+  int waited_ms;
+  net_addr_t client_addr;
   void (*prev_sigint)(int);
 
   net_transport_init();
   net_session_reset();
 
-  server_socket = net_listen(port);
-  if (server_socket < 0) {
-    lprintf(LO_ERROR, "net_session_host_start: failed to listen on port %d\n", port);
+  sock = net_udp_open(port);
+  if (sock < 0) {
+    lprintf(LO_ERROR, "net_session_host_start: failed to open UDP port %d\n", port);
     return -1;
   }
 
-  lprintf(LO_INFO, "Waiting for player to connect on port %d... (press Ctrl-C to cancel)\n", port);
+  lprintf(LO_INFO, "Waiting for player to connect on UDP port %d... (press Ctrl-C to cancel)\n", port);
 
-  // Poll for client connection with a timeout so SIGINT can interrupt.
-  // Save the existing handler so we restore it exactly: the engine installs
-  // I_IntHandler for graceful shutdown before we get here, and restoring
-  // SIG_DFL would kill the process immediately on any later Ctrl-C.
+  // Wait for a HELLO with our protocol magic, polling once a second so Ctrl-C
+  // can interrupt. Save the existing handler so we restore it exactly: the
+  // engine installs I_IntHandler for graceful shutdown before we get here, and
+  // restoring SIG_DFL would kill the process immediately on any later Ctrl-C.
   net_interrupted = 0;
   prev_sigint = signal(SIGINT, net_sigint_handler);
 
-  client_sock = -1;
-  while (client_sock < 0) {
-    fd_set readfds;
-    struct timeval tv;
-    int sel;
+  while (1) {
+    if (net_session_wait(sock, 1000, prev_sigint, "host") <= 0)
+      continue;
 
-    if (net_interrupted) {
-      lprintf(LO_INFO, "Interrupted, aborting host.\n");
-      signal(SIGINT, prev_sigint);
-      net_close(server_socket);
-      server_socket = -1;
-      I_SafeExit(0);
-    }
+    msg_type = net_recv_packet_from(sock, buf, &len, sizeof(buf), &client_addr);
+    if (msg_type != NET_MSG_HELLO)
+      continue;
 
-    FD_ZERO(&readfds);
-    FD_SET(server_socket, &readfds);
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    sel = select(server_socket + 1, &readfds, NULL, NULL, &tv);
-    if (sel > 0)
-      client_sock = net_accept(server_socket);
+    if (net_read_hello(buf, len) == NET_PROTOCOL_MAGIC)
+      break;
+
+    lprintf(LO_WARN, "Rejected player at %s: different NexusDoom version\n",
+            net_addr_string(&client_addr));
+    net_send_packet_to(sock, &client_addr, NET_MSG_QUIT, NULL, 0);
   }
 
-  signal(SIGINT, prev_sigint);
+  lprintf(LO_INFO, "Player connected from %s\n", net_addr_string(&client_addr));
 
-  // Close the server socket — we only need the one client
-  net_close(server_socket);
-  server_socket = -1;
+  // From now on only exchange datagrams with this player.
+  if (net_udp_connect_addr(sock, &client_addr) != 0) {
+    net_close(sock);
+    signal(SIGINT, prev_sigint);
+    return -1;
+  }
 
-  net_session.socket = client_sock;
+  net_session.socket = sock;
   net_session.is_host = 1;
   net_session.local_player = 0;
   net_session.remote_player = 1;
   net_session.state = NET_STATE_CONNECTING;
 
-  // Send game settings to client
+  // Send game settings to client, again for every repeated HELLO (our SETUP
+  // may have been lost), until READY arrives. A TICCMD also means the client
+  // got SETUP and started (READY was lost); it resends that TICCMD itself.
   net_session_build_setup(&setup);
-  len = net_write_setup(buf, &setup);
-  if (net_send_packet(client_sock, NET_MSG_SETUP, buf, len) != 0) {
-    lprintf(LO_ERROR, "net_session_host_start: failed to send setup\n");
-    net_session_disconnect();
-    return -1;
-  }
+  setup_len = net_write_setup(setup_buf, &setup);
+  net_send_packet(sock, NET_MSG_SETUP, setup_buf, setup_len);
 
   lprintf(LO_INFO, "Sent game settings, waiting for client ready...\n");
 
-  // Wait for READY from client — bounded to avoid an indefinite hang if the
-  // client connects but never sends its acknowledgement.
-  msg_type = net_recv_packet_timeout(client_sock, buf, &len, sizeof(buf),
-                                     NET_HANDSHAKE_TIMEOUT_MS);
-  if (msg_type == NET_RECV_TIMEOUT) {
-    lprintf(LO_ERROR, "net_session_host_start: timed out waiting for client READY\n");
-    net_session_disconnect();
-    return -1;
+  waited_ms = 0;
+  while (1) {
+    if (waited_ms >= NET_HANDSHAKE_TIMEOUT_MS) {
+      lprintf(LO_ERROR, "net_session_host_start: timed out waiting for client READY\n");
+      signal(SIGINT, prev_sigint);
+      net_session_disconnect();
+      return -1;
+    }
+
+    if (net_session_wait(sock, 500, prev_sigint, "host") <= 0) {
+      waited_ms += 500;
+      continue;
+    }
+
+    msg_type = net_recv_packet(sock, buf, &len, sizeof(buf));
+    if (msg_type == NET_MSG_READY || msg_type == NET_MSG_TICCMD)
+      break;
+    if (msg_type == NET_MSG_HELLO)
+      net_send_packet(sock, NET_MSG_SETUP, setup_buf, setup_len);
+    else if (msg_type == NET_MSG_QUIT) {
+      lprintf(LO_ERROR, "net_session_host_start: client quit during handshake\n");
+      signal(SIGINT, prev_sigint);
+      net_session_disconnect();
+      return -1;
+    }
   }
-  if (msg_type != NET_MSG_READY) {
-    lprintf(LO_ERROR, "net_session_host_start: expected READY, got %d\n", msg_type);
-    net_session_disconnect();
-    return -1;
-  }
+
+  signal(SIGINT, prev_sigint);
 
   net_session.state = NET_STATE_PLAYING;
   net_session_register_disconnect_atexit();
@@ -303,44 +323,26 @@ int net_session_host_start(int port)
 int net_session_client_start(const char *address, int port)
 {
   net_setup_t setup;
-  unsigned char buf[NET_SETUP_SIZE + NET_HEADER_SIZE];
+  unsigned char buf[NET_MAX_PACKET];
+  unsigned char hello[NET_HELLO_SIZE];
   int len;
   int sock;
   int msg_type;
   int attempts;
+  int i;
   void (*prev_sigint)(int);
 
   net_transport_init();
   net_session_reset();
 
-  lprintf(LO_INFO, "Connecting to %s:%d... (press Ctrl-C to cancel)\n", address, port);
+  sock = net_udp_open(0);
+  if (sock < 0)
+    return -1;
 
-  // Retry until the host is available, or user interrupts with Ctrl-C.
-  net_interrupted = 0;
-  prev_sigint = signal(SIGINT, net_sigint_handler);
-  attempts = 0;
-  sock = -1;
-
-  while (sock < 0) {
-    if (net_interrupted) {
-      lprintf(LO_INFO, "Interrupted, aborting join.\n");
-      signal(SIGINT, prev_sigint);
-      I_SafeExit(0);
-    }
-
-    sock = net_connect(address, port);
-    if (sock >= 0)
-      break;
-
-    attempts++;
-    if (attempts == 1 || attempts % 5 == 0) {
-      lprintf(LO_INFO, "Still waiting for host at %s:%d...\n", address, port);
-    }
-
-    I_uSleep(1000000);
+  if (net_udp_connect(sock, address, port) != 0) {
+    net_close(sock);
+    return -1;
   }
-
-  signal(SIGINT, prev_sigint);
 
   net_session.socket = sock;
   net_session.is_host = 0;
@@ -348,20 +350,40 @@ int net_session_client_start(const char *address, int port)
   net_session.remote_player = 0;
   net_session.state = NET_STATE_CONNECTING;
 
-  // Receive game settings from host — bounded to avoid an indefinite hang if
-  // the host accepts but never sends the SETUP packet.
-  msg_type = net_recv_packet_timeout(sock, buf, &len, sizeof(buf),
-                                     NET_HANDSHAKE_TIMEOUT_MS);
-  if (msg_type == NET_RECV_TIMEOUT) {
-    lprintf(LO_ERROR, "net_session_client_start: timed out waiting for host SETUP\n");
-    net_session_disconnect();
-    return -1;
+  lprintf(LO_INFO, "Connecting to %s:%d... (press Ctrl-C to cancel)\n", address, port);
+
+  // Send HELLO every 500 ms until the host answers with SETUP, or the user
+  // interrupts with Ctrl-C.
+  net_interrupted = 0;
+  prev_sigint = signal(SIGINT, net_sigint_handler);
+  net_write_hello(hello, NET_PROTOCOL_MAGIC);
+  attempts = 0;
+
+  while (1) {
+    net_send_packet(sock, NET_MSG_HELLO, hello, NET_HELLO_SIZE);
+
+    if (net_session_wait(sock, 500, prev_sigint, "join") > 0) {
+      msg_type = net_recv_packet(sock, buf, &len, sizeof(buf));
+
+      if (msg_type == NET_MSG_SETUP && len == NET_SETUP_SIZE)
+        break;
+
+      if (msg_type == NET_MSG_QUIT) {
+        signal(SIGINT, prev_sigint);
+        net_session_disconnect();
+        I_Error("The host at %s:%d runs a different NexusDoom version", address, port);
+      }
+
+      continue;
+    }
+
+    attempts++;
+    if (attempts == 1 || attempts % 10 == 0) {
+      lprintf(LO_INFO, "Still waiting for host at %s:%d...\n", address, port);
+    }
   }
-  if (msg_type != NET_MSG_SETUP) {
-    lprintf(LO_ERROR, "net_session_client_start: expected SETUP, got %d\n", msg_type);
-    net_session_disconnect();
-    return -1;
-  }
+
+  signal(SIGINT, prev_sigint);
 
   net_read_setup(buf, &setup);
   net_session_apply_setup(&setup);
@@ -369,12 +391,10 @@ int net_session_client_start(const char *address, int port)
   lprintf(LO_INFO, "Received game settings (skill=%d, episode=%d, map=%d)\n",
           setup.skill, setup.episode, setup.map);
 
-  // Send READY to host
-  if (net_send_packet(sock, NET_MSG_READY, NULL, 0) != 0) {
-    lprintf(LO_ERROR, "net_session_client_start: failed to send READY\n");
-    net_session_disconnect();
-    return -1;
-  }
+  // Send READY to host. Repeated in case one is lost; the host also accepts
+  // our first TICCMD instead.
+  for (i = 0; i < 3; i++)
+    net_send_packet(sock, NET_MSG_READY, NULL, 0);
 
   net_session.state = NET_STATE_PLAYING;
   net_session_register_disconnect_atexit();
@@ -384,6 +404,8 @@ int net_session_client_start(const char *address, int port)
 
 void net_session_disconnect(void)
 {
+  int i;
+
   if (net_session.state == NET_STATE_DISCONNECTED)
     return;
 
@@ -392,14 +414,10 @@ void net_session_disconnect(void)
     dsda_EndDemoRecording();
 
   if (net_session.socket >= 0) {
-    // Try to send QUIT (best effort, ignore errors)
-    net_send_packet(net_session.socket, NET_MSG_QUIT, NULL, 0);
+    // Tell the peer (best effort; repeated because datagrams can be lost)
+    for (i = 0; i < 3; i++)
+      net_send_packet(net_session.socket, NET_MSG_QUIT, NULL, 0);
     net_close(net_session.socket);
-  }
-
-  if (server_socket >= 0) {
-    net_close(server_socket);
-    server_socket = -1;
   }
 
   // Remove the remote player from the game; keep the local player active

@@ -194,10 +194,32 @@ static void NetFrameLog(char type, const char *fmt, ...)
 
 static dboolean net_waiting_for_peer;
 static dboolean net_connection_lost;
-// Show "waiting for peer" once the remote cmd is this late; from then on, poll
-// the socket with a timeout instead of spinning the render loop.
+// Show "waiting for peer" once the remote cmd is this late; from then on, wait
+// on the socket with a timeout instead of spinning the render loop.
 #define NET_WAIT_PEER_MESSAGE_US 1000000ULL
-#define NET_WAIT_POLL_TIMEOUT_MS 50
+#define NET_WAIT_POLL_TIMEOUT_MS 20
+// While waiting for the peer's cmd, resend our unacknowledged cmds this often.
+#define NET_RESEND_US 20000ULL
+// Give up on a peer that has sent nothing for this long.
+#define NET_PEER_TIMEOUT_US 30000000ULL
+
+// Reliable cmd stream over UDP. Each peer numbers the cmds it sends 0, 1, 2, ...
+// (sequence numbers). Unlike tics, these keep counting through key-frame
+// restores, so a cmd from before a rewind can never be mistaken for one after
+// it. Our cmds the peer hasn't acknowledged yet (net_peer_ack up to
+// net_local_seq - 1) stay in net_send_ring and go out with every packet, so a
+// lost datagram is covered by the next one.
+static unsigned int net_local_seq;  // our cmds sent so far
+static unsigned int net_peer_ack;   // of those, the peer has the ones below this
+static unsigned int net_remote_seq; // peer's cmds received so far
+static ticcmd_t net_send_ring[NET_TICS_MAX_CMDS];
+static unsigned short net_epoch;    // key-frame restores so far; tags checksums
+static unsigned long long net_last_send_us;
+static unsigned long long net_last_recv_us;
+// Latest local desync checksum, sent along with every packet until replaced.
+static unsigned int net_send_checksum_tic;
+static unsigned int net_send_checksum;
+static unsigned int net_remote_checksum_seen_tic;
 static unsigned int net_local_checksum_tic[BACKUPTICS];
 static unsigned int net_local_checksum_value[BACKUPTICS];
 static dboolean net_local_checksum_valid[BACKUPTICS];
@@ -253,6 +275,8 @@ static void NetLogSimSettings(void)
 static void NetResetChecksumState(void)
 {
   net_diag_settings_logged = false;
+  net_send_checksum_tic = NET_NO_CHECKSUM;
+  net_remote_checksum_seen_tic = NET_NO_CHECKSUM;
   memset(net_local_checksum_valid, 0, sizeof(net_local_checksum_valid));
   memset(net_remote_checksum_valid, 0, sizeof(net_remote_checksum_valid));
   net_out_of_sync = false;
@@ -330,6 +354,12 @@ void NetResetState(void)
 {
   remote_maketic = 0;
   net_pacing_next_tic_us = 0;
+  net_local_seq = 0;
+  net_peer_ack = 0;
+  net_remote_seq = 0;
+  net_epoch = 0;
+  net_last_send_us = 0;
+  net_last_recv_us = 0;
   NetResetRenderClock();
   NetResetChecksumState();
 }
@@ -341,6 +371,9 @@ static void NetResetAfterRestore(void)
 {
   maketic = gametic;
   remote_maketic = gametic;
+  // Sequence numbers keep counting: the cmd streams just continue with the
+  // restored tic. Checksums from before the restore no longer apply.
+  net_epoch++;
   net_pacing_next_tic_us = 0;
   NetResetRenderClock();
   NetResetChecksumState();
@@ -515,8 +548,6 @@ static void NetMaybeSendChecksum(void)
   unsigned int tic;
   unsigned int checksum;
   int idx;
-  unsigned char buf[NET_CHECKSUM_SIZE];
-  net_checksum_msg_t msg;
 
   tic = (unsigned int)gametic;
   if ((tic % TICRATE) != 0)
@@ -531,17 +562,9 @@ static void NetMaybeSendChecksum(void)
   net_local_checksum_value[idx] = checksum;
   net_local_checksum_valid[idx] = true;
 
-  msg.gametic = tic;
-  msg.checksum = checksum;
-  net_write_checksum(buf, &msg);
-
-  if (net_send_packet(net_session.socket, NET_MSG_CHECKSUM, buf, NET_CHECKSUM_SIZE) != 0) {
-    lprintf(LO_ERROR, "NetMaybeSendChecksum: failed to send checksum\n");
-    net_waiting_for_peer = false;
-    net_connection_lost = true;
-    net_session_disconnect();
-    return;
-  }
+  // Goes out with every TICCMD packet until the next checksum replaces it.
+  net_send_checksum_tic = tic;
+  net_send_checksum = checksum;
 
   if (net_desync_diag) {
     lprintf(LO_INFO,
@@ -691,11 +714,33 @@ void FakeNetUpdate(void)
   }
 }
 
-// Build local ticcmd, send it to remote, receive remote's ticcmd.
+// Send every cmd the peer hasn't acknowledged yet, plus our ack and latest
+// checksum. waiting: we have been waiting for the peer's cmd for a while (asks
+// the peer to resend at once if we lack some of its cmds).
+static void NetSendTics(dboolean waiting)
+{
+  unsigned char buf[NET_TICS_MAX_SIZE];
+  net_tics_msg_t msg;
+  int i;
+
+  msg.epoch = net_epoch;
+  msg.flags = waiting ? NET_TICS_WAITING : 0;
+  msg.ack_seq = net_remote_seq;
+  msg.checksum_tic = net_send_checksum_tic;
+  msg.checksum = net_send_checksum;
+  msg.start_seq = net_peer_ack;
+  msg.count = (int)(net_local_seq - net_peer_ack);
+  for (i = 0; i < msg.count; i++)
+    msg.cmds[i] = net_send_ring[(net_peer_ack + i) % NET_TICS_MAX_CMDS];
+
+  net_send_packet(net_session.socket, NET_MSG_TICCMD, buf, net_write_tics(buf, &msg));
+  net_last_send_us = dsda_ElapsedTime(dsda_timer_realtime);
+}
+
+// Build local ticcmd and send it to remote.
 // For multiplayer: builds exactly one tic per call.
 static void NetUpdate(void)
 {
-  unsigned char buf[64];
   int local = net_session.local_player;
 
   if (isExtraDDisplay)
@@ -743,94 +788,169 @@ static void NetUpdate(void)
     pending_key_frame_op = KF_OP_NONE;
   }
 
-  // Send to remote
-  net_write_ticcmd(buf, &local_cmds[local][maketic % BACKUPTICS]);
-  if (net_send_packet(net_session.socket, NET_MSG_TICCMD, buf, NET_TICCMD_SIZE) != 0) {
-    lprintf(LO_ERROR, "NetUpdate: failed to send ticcmd\n");
+  // Queue the cmd until the peer acknowledges it, and send. Lockstep keeps the
+  // peer within a few cmds of us, so a full ring means something is broken.
+  if (net_local_seq - net_peer_ack >= NET_TICS_MAX_CMDS) {
+    lprintf(LO_ERROR, "NetUpdate: peer stopped acknowledging cmds\n");
     net_waiting_for_peer = false;
     net_connection_lost = true;
     net_session_disconnect();
     return;
   }
 
+  net_send_ring[net_local_seq % NET_TICS_MAX_CMDS] = local_cmds[local][maketic % BACKUPTICS];
+  net_local_seq++;
   maketic++;
+  NetSendTics(false);
 }
 
-// Receive remote player's ticcmd for gametic. Doesn't block, so the caller
-// can keep rendering while the cmd is underway (only polls with a timeout once
-// the peer is so late that "waiting for peer" is shown).
-// Returns 0 on success, 1 if the cmd hasn't arrived yet, -1 on error.
-static int NetRecvRemoteTic(void)
+// Whether the cmds for this not-yet-executed tic restore or rewind a key
+// frame, in which case the peer's next cmd belongs to the restored timeline.
+static dboolean NetTicRestores(int tic)
 {
-  unsigned char buf[64];
+  byte op = local_cmds[net_session.remote_player][tic % BACKUPTICS].ex.key_frame_op;
+
+  if (maketic > tic)
+    op |= local_cmds[net_session.local_player][tic % BACKUPTICS].ex.key_frame_op;
+
+  return (op & (KF_OP_RESTORE | KF_OP_REWIND)) != 0;
+}
+
+static void NetHandleTics(const unsigned char *buf, int len, unsigned long long now)
+{
+  net_tics_msg_t msg;
+  int remote = net_session.remote_player;
+  int i;
+
+  if (net_read_tics(buf, len, &msg) < 0)
+    return;
+
+  // Acks only grow; a late datagram may carry an older one.
+  if ((int)(msg.ack_seq - net_peer_ack) > 0 && (int)(msg.ack_seq - net_local_seq) <= 0)
+    net_peer_ack = msg.ack_seq;
+
+  for (i = 0; i < msg.count; i++) {
+    unsigned int seq = msg.start_seq + i;
+
+    if ((int)(seq - net_remote_seq) < 0)
+      continue; // already have it
+    if (seq != net_remote_seq)
+      break;    // can't happen: the peer starts at our ack
+
+    // The cmd after a restore is for the restored tic. Don't take it before
+    // we have executed that restore ourselves (which resets remote_maketic);
+    // the peer keeps resending it until we acknowledge it.
+    if (remote_maketic > gametic && NetTicRestores(remote_maketic - 1))
+      break;
+    if (remote_maketic - gametic >= BACKUPTICS)
+      break; // no free slot (can't happen in lockstep)
+
+    local_cmds[remote][remote_maketic % BACKUPTICS] = msg.cmds[i];
+    NetFrameLog('R', "%d", remote_maketic);
+    remote_maketic++;
+    net_remote_seq++;
+  }
+
+  // The peer's latest checksum, if it is for our timeline and newer than any
+  // we have seen (a reordered datagram may carry an older one).
+  if (msg.checksum_tic != NET_NO_CHECKSUM && msg.epoch == net_epoch &&
+      (net_remote_checksum_seen_tic == NET_NO_CHECKSUM ||
+       msg.checksum_tic > net_remote_checksum_seen_tic)) {
+    int idx = msg.checksum_tic % BACKUPTICS;
+
+    net_remote_checksum_seen_tic = msg.checksum_tic;
+    net_remote_checksum_tic[idx] = msg.checksum_tic;
+    net_remote_checksum_value[idx] = msg.checksum;
+    net_remote_checksum_valid[idx] = true;
+    net_diag_last_remote_tic = msg.checksum_tic;
+    net_diag_last_remote_checksum = msg.checksum;
+
+    if (net_desync_diag) {
+      lprintf(LO_INFO, "Net checksum recv tic=%u remote=%08x\n",
+              msg.checksum_tic, msg.checksum);
+    }
+
+    NetCompareChecksumForTic(msg.checksum_tic);
+  }
+
+  // The peer has been waiting and lacks cmds we already sent: resend now
+  // rather than when our own timer fires.
+  if ((msg.flags & NET_TICS_WAITING) && (int)(msg.ack_seq - net_local_seq) < 0 &&
+      now - net_last_send_us >= NET_RESEND_US)
+    NetSendTics(false);
+}
+
+// Read every waiting datagram. Called on every pass of the game loop, so the
+// peer's cmds, acks and resend requests are handled even while we aren't
+// waiting for anything. Returns -1 if the session ended.
+static int NetPollNetwork(void)
+{
+  unsigned char buf[NET_MAX_PACKET];
   int len;
   int msg_type;
-  int remote = net_session.remote_player;
+  unsigned long long now = dsda_ElapsedTime(dsda_timer_realtime);
 
-  while (remote_maketic <= gametic) {
-    int timeout_ms = net_waiting_for_peer ? NET_WAIT_POLL_TIMEOUT_MS : 0;
-    int wait_result = net_wait_for_packet(net_session.socket, timeout_ms);
-
-    if (wait_result == 0) {
-      if (!net_waiting_for_peer &&
-          dsda_ElapsedTime(dsda_timer_realtime) - net_tic_due_plan_us >= NET_WAIT_PEER_MESSAGE_US) {
-        lprintf(LO_INFO, "NetRecvRemoteTic: waiting for remote tic %d\n", gametic);
-        net_waiting_for_peer = true;
-        NetUpdateOutOfSyncMessage();
-      }
-
-      return 1;
-    }
-
-    if (wait_result < 0) {
-      lprintf(LO_ERROR, "NetRecvRemoteTic: socket wait failed\n");
+  while ((msg_type = net_recv_packet(net_session.socket, buf, &len, sizeof(buf)))
+         != NET_RECV_NONE) {
+    if (msg_type < 0 || msg_type == NET_MSG_QUIT) {
+      lprintf(LO_ERROR, "NetPollNetwork: remote disconnected\n");
       net_waiting_for_peer = false;
       net_connection_lost = true;
       net_session_disconnect();
       return -1;
     }
 
-    msg_type = net_recv_packet(net_session.socket, buf, &len, sizeof(buf));
+    net_last_recv_us = now;
 
-    if (msg_type == NET_MSG_TICCMD) {
-      net_read_ticcmd(buf, &local_cmds[remote][remote_maketic % BACKUPTICS]);
-      NetFrameLog('R', "%d", remote_maketic);
-      remote_maketic++;
-      net_waiting_for_peer = false;
-    }
-    else if (msg_type == NET_MSG_CHECKSUM) {
-      net_checksum_msg_t msg;
-      int idx;
-
-      if (len != NET_CHECKSUM_SIZE)
-        continue;
-
-      net_read_checksum(buf, &msg);
-      idx = msg.gametic % BACKUPTICS;
-      net_remote_checksum_tic[idx] = msg.gametic;
-      net_remote_checksum_value[idx] = msg.checksum;
-      net_remote_checksum_valid[idx] = true;
-      net_diag_last_remote_tic = msg.gametic;
-      net_diag_last_remote_checksum = msg.checksum;
-
-      if (net_desync_diag) {
-        lprintf(LO_INFO, "Net checksum recv tic=%u remote=%08x\n",
-                msg.gametic, msg.checksum);
-      }
-
-      NetCompareChecksumForTic(msg.gametic);
-    }
-    else if (msg_type == NET_MSG_QUIT || msg_type < 0) {
-      lprintf(LO_ERROR, "NetRecvRemoteTic: remote disconnected\n");
-      net_waiting_for_peer = false;
-      net_connection_lost = true;
-      net_session_disconnect();
-      return -1;
-    }
-    // Ignore unknown message types
+    if (msg_type == NET_MSG_TICCMD)
+      NetHandleTics(buf, len, now);
+    // Repeated handshake messages (HELLO, READY) are ignored.
   }
 
   return 0;
+}
+
+// Check whether the remote player's ticcmd for gametic has arrived (received
+// by NetPollNetwork). Doesn't block, so the caller can keep rendering while the
+// cmd is underway; only once the peer is so late that "waiting for peer" is
+// shown does it wait on the socket briefly. Resends our unacknowledged cmds
+// while waiting, which recovers a datagram lost in either direction.
+// Returns 0 on success, 1 if the cmd hasn't arrived yet, -1 on error.
+static int NetRecvRemoteTic(void)
+{
+  unsigned long long now, last_heard;
+
+  if (remote_maketic > gametic) {
+    net_waiting_for_peer = false;
+    return 0;
+  }
+
+  now = dsda_ElapsedTime(dsda_timer_realtime);
+
+  if (now - net_last_send_us >= NET_RESEND_US)
+    NetSendTics(true);
+
+  last_heard = net_last_recv_us > net_tic_due_plan_us ? net_last_recv_us
+                                                      : net_tic_due_plan_us;
+  if (now - last_heard >= NET_PEER_TIMEOUT_US) {
+    lprintf(LO_ERROR, "NetRecvRemoteTic: nothing heard from the peer for %llu s\n",
+            NET_PEER_TIMEOUT_US / 1000000);
+    net_waiting_for_peer = false;
+    net_connection_lost = true;
+    net_session_disconnect();
+    return -1;
+  }
+
+  if (!net_waiting_for_peer && now - net_tic_due_plan_us >= NET_WAIT_PEER_MESSAGE_US) {
+    lprintf(LO_INFO, "NetRecvRemoteTic: waiting for remote tic %d\n", gametic);
+    net_waiting_for_peer = true;
+    NetUpdateOutOfSyncMessage();
+  }
+
+  if (net_waiting_for_peer)
+    net_wait_for_packet(net_session.socket, NET_WAIT_POLL_TIMEOUT_MS);
+
+  return 1;
 }
 
 // Unified multiplayer tic-advance protocol. Encapsulates the entire lockstep
@@ -843,6 +963,9 @@ static int NetRecvRemoteTic(void)
 //  -1  — disconnected (session torn down, caller should bail)
 static int NetRunOneTic(void)
 {
+  if (NetPollNetwork() < 0)
+    return -1;
+
   // ---------------------------------------------------------------------------
   // Pacing gate: throttle the lockstep loop to the synchronized game_speed.
   //

@@ -113,16 +113,62 @@ int net_read_setup(const unsigned char *buf, net_setup_t *setup)
   return NET_SETUP_SIZE;
 }
 
-int net_write_checksum(unsigned char *buf, const net_checksum_msg_t *msg)
+int net_write_tics(unsigned char *buf, const net_tics_msg_t *msg)
 {
-  write_i32(&buf[0], (int)msg->gametic);
-  write_i32(&buf[4], (int)msg->checksum);
-  return NET_CHECKSUM_SIZE;
+  int i;
+  int count = msg->count;
+
+  if (count < 0) count = 0;
+  if (count > NET_TICS_MAX_CMDS) count = NET_TICS_MAX_CMDS;
+
+  write_i16(&buf[0], msg->epoch);
+  buf[2] = msg->flags;
+  write_i32(&buf[3], (int)msg->ack_seq);
+  write_i32(&buf[7], (int)msg->checksum_tic);
+  write_i32(&buf[11], (int)msg->checksum);
+  write_i32(&buf[15], (int)msg->start_seq);
+  buf[19] = (unsigned char)count;
+
+  for (i = 0; i < count; i++)
+    net_write_ticcmd(&buf[NET_TICS_HEADER_SIZE + i * NET_TICCMD_SIZE], &msg->cmds[i]);
+
+  return NET_TICS_HEADER_SIZE + count * NET_TICCMD_SIZE;
 }
 
-int net_read_checksum(const unsigned char *buf, net_checksum_msg_t *msg)
+int net_read_tics(const unsigned char *buf, int length, net_tics_msg_t *msg)
 {
-  msg->gametic = (unsigned int)read_i32(&buf[0]);
-  msg->checksum = (unsigned int)read_i32(&buf[4]);
-  return NET_CHECKSUM_SIZE;
+  int i;
+
+  if (length < NET_TICS_HEADER_SIZE)
+    return -1;
+
+  msg->epoch        = (unsigned short)read_i16(&buf[0]);
+  msg->flags        = buf[2];
+  msg->ack_seq      = (unsigned int)read_i32(&buf[3]);
+  msg->checksum_tic = (unsigned int)read_i32(&buf[7]);
+  msg->checksum     = (unsigned int)read_i32(&buf[11]);
+  msg->start_seq    = (unsigned int)read_i32(&buf[15]);
+  msg->count        = buf[19];
+
+  if (msg->count > NET_TICS_MAX_CMDS ||
+      length != NET_TICS_HEADER_SIZE + msg->count * NET_TICCMD_SIZE)
+    return -1;
+
+  for (i = 0; i < msg->count; i++)
+    net_read_ticcmd(&buf[NET_TICS_HEADER_SIZE + i * NET_TICCMD_SIZE], &msg->cmds[i]);
+
+  return length;
+}
+
+int net_write_hello(unsigned char *buf, unsigned int magic)
+{
+  write_i32(&buf[0], (int)magic);
+  return NET_HELLO_SIZE;
+}
+
+unsigned int net_read_hello(const unsigned char *buf, int length)
+{
+  if (length < NET_HELLO_SIZE)
+    return 0;
+  return (unsigned int)read_i32(&buf[0]);
 }

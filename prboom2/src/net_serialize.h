@@ -28,10 +28,16 @@ int net_write_setup(unsigned char *buf, const net_setup_t *setup);
 // Deserialize net_setup_t from buffer. Returns bytes read.
 int net_read_setup(const unsigned char *buf, net_setup_t *setup);
 
-// Serialize net_checksum_msg_t to buffer. Returns bytes written.
-int net_write_checksum(unsigned char *buf, const net_checksum_msg_t *msg);
+// Serialize a TICCMD message to buffer (at least NET_TICS_MAX_SIZE bytes).
+// Returns bytes written.
+int net_write_tics(unsigned char *buf, const net_tics_msg_t *msg);
 
-// Deserialize net_checksum_msg_t from buffer. Returns bytes read.
-int net_read_checksum(const unsigned char *buf, net_checksum_msg_t *msg);
+// Deserialize a TICCMD message of the given length.
+// Returns bytes read, or -1 if the message is malformed.
+int net_read_tics(const unsigned char *buf, int length, net_tics_msg_t *msg);
+
+// HELLO payload: the protocol magic.
+int net_write_hello(unsigned char *buf, unsigned int magic);
+unsigned int net_read_hello(const unsigned char *buf, int length);
 
 #endif
