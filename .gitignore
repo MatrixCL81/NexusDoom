@@ -36,3 +36,4 @@ CMakePresets.json
 deploy.sh
 /prboom2/.cache/
 compile_commands.json
+local_instructions.md

@@ -1,11 +1,3 @@
-## About me, the user
-
-I am a senior full-stack web developer with experience in C# and other languages, but not with C. Although the goal is real, which is to actually be able to do tool-assisted speedruns with others over the internet, this is also a test to see how far I can get with vibe-coding.
-
-## About the repository
-
-I have two GitHub accounts: `github.com/MaartenCL` is my professional account and `github.com/MatrixCL81` my personal account. This repository was originally forked from `github.com/kraflab/dsda-doom` to my professional account, but it has since been transferred to my personal account.
-
 ## Golden rule: game mechanics must stay identical to DSDA-Doom
 
 Speedruns are only valid if the game behaves exactly like the original. **Never change how the engine executes a ticcmd:** nothing in the play simulation (`p_*.c`, `m_random.c`, `r_*.c` where it affects gameplay, `G_Ticker`'s command handling, demo encoding/decoding, compatibility levels). Multiplayer code may only:
@@ -16,7 +8,7 @@ Speedruns are only valid if the game behaves exactly like the original. **Never 
 
 Rounding input to demo precision (`G_NormalizeTiccmd`) is allowed: vanilla Doom does exactly that while recording. It changes the input, not the mechanics. If a change touches anything beyond input and networking, stop and ask the user first.
 
-**How to verify:** build unmodified DSDA-Doom (`/data/repositories/dsda-doom`, the upstream commit NexusDoom branched from) and NexusDoom. Play every demo in `/data/games/doom/replays` in both with `-iwad /data/games/doom/wads/doom.wad -timedemo <demo> -nodraw -nosound -levelstat -analysis`, each in its own working directory with its own `HOME`. The `Timed N gametics` line, `levelstat.txt` and `analysis.txt` must be identical for every demo. Last verified 2026-09-27: all 1,725 demos (1,721 playable, 630 finished levels, 277 NexusDoom multiplayer recordings) were identical.
+**How to verify:** build unmodified DSDA-Doom (the upstream commit NexusDoom branched from) and NexusDoom. Play every demo from the replays folder in both with `-iwad <doom.wad> -timedemo <demo> -nodraw -nosound -levelstat -analysis`, each in its own working directory with its own `HOME`. The `Timed N gametics` line, `levelstat.txt` and `analysis.txt` must be identical for every demo. Last verified 2026-09-27: all 1,725 demos (1,721 playable, 630 finished levels, 277 NexusDoom multiplayer recordings) were identical.
 
 ## Building
 
@@ -27,6 +19,10 @@ mkdir -p build && cd build
 cmake ../prboom2 -DCMAKE_BUILD_TYPE=Release
 make -j"$(nproc)"      # produces ./nexusdoom
 ```
+
+### Local instructions
+
+`local_instructions.md`, if it exists, provides guidance for local setup and environment-specific instructions. This file is in `.gitignore`, so that it can contain sensitive or machine-specific information without being committed to the repository. The paths to WAD files, replays, the upstream DSDA-Doom checkout and other local resources are specified there. **Read it before building, running the game or verifying demos.**
 
 ## Multiplayer architecture
 
@@ -92,7 +88,7 @@ The HUD status line (`NetUpdateOutOfSyncMessage`) shows, in priority order: conn
 
 - **Latency limit (lockstep without input delay):** a tic can't complete faster than the one-way network latency, because each peer only sends cmd g+1 after executing tic g. So at 100% speed (28.6 ms/tic), more than ~28 ms one-way latency (RTT > ~57 ms, e.g. a mobile hotspot) slows the game below 35 tics/s; a simulated 40 ms one-way delay gave ~24 tics/s. At 25% speed the limit is ~114 ms. This is inherent to lockstep without input delay, which is a deliberate design choice. Measured with a simulated 138 ms ping (Finland ↔ California): at most ~13.7 tics/s whatever the speed setting; 35% and slower run smoothly at full rate, and 30% leaves room for jitter.
 - Render smoothness was verified with headless runs (`SDL_VIDEODRIVER=dummy`, two local instances, `-netframelog`), including simulated peer frame rates of 35/60/240 fps and 10–40 ms latency (via a delaying proxy). Mean view error went from 0.5–44 ms per frame to ~0.1 ms. The user confirmed it visually.
-- UDP transport verified headless through `tools/netimpair.py`: up to 20% loss with duplication and reordering, plus a temporary test hook (not committed) that made both peers request ~20 quick restores/rewinds per run. Result: no desyncs, the demos recorded on both peers had identical tic data, and the host detected a killed client after 30 s. **Not yet verified:** the Windows build of the UDP code (no cross-compiler here) and a real internet session.
+- UDP transport verified headless through `tools/netimpair.py`: up to 20% loss with duplication and reordering, plus a temporary test hook (not committed) that made both peers request ~20 quick restores/rewinds per run. Result: no desyncs, the demos recorded on both peers had identical tic data, and the host detected a killed client after 30 s. The Windows (MSVC) build compiles without warnings in the net code, and a local host + client test on Windows (2026-10-06, headless, 420 tics) handshaked over UDP and had identical checksums. **Not yet verified:** a real internet session.
 - A quick key-frame restore plays the screen wipe (`dsda_RestoreKeyFrame(&quick_kf, false)`), which in MP runs at game speed: ~1.1 s at 100%, ~3.8 s at 30%. Rewinds skip it. This is unchanged behaviour, not a network stall.
 - Self-replay only happens on a peer that is recording a demo (`demorecording`). This is harmless for sync, because replay only changes where the local cmd comes from.
 - Out of sync after two quick rewinds: likely fixed together with the rewind-during-replay desync (restore/rewind used to be skipped on a peer that was still replaying). Needs retesting. If it persists, suspect auto-key-frame settings or the wall-clock "slow key framing" timeout, which differ per machine.

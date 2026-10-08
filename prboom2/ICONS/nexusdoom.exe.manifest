@@ -2,7 +2,7 @@
 <!-- What's this??? It's for WinXP. See bug#466423 if you're interested -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
 <assemblyIdentity
-    version="1.0.0.0"
+    version="1.1.0.0"
     processorArchitecture="*"
     name="nexusdoom.nexusdoom.nexusdoom"
     type="win32"
