@@ -128,6 +128,7 @@ typedef enum {
   dsda_config_gl_usevbo,
   dsda_config_gl_fade_mode,
   dsda_config_use_mouse,
+  dsda_config_mouse_menu_navigation,
   dsda_config_mouse_sensitivity_horiz,
   dsda_config_mouse_sensitivity_vert,
   dsda_config_mouse_acceleration,
@@ -156,6 +157,7 @@ typedef enum {
   dsda_config_snd_midiplayer,
   dsda_config_snd_mididev,
   dsda_config_snd_soundfont,
+  dsda_config_snd_device,
   dsda_config_mus_fluidsynth_chorus,
   dsda_config_mus_fluidsynth_reverb,
   dsda_config_mus_fluidsynth_gain,
@@ -327,6 +329,7 @@ int dsda_DecrementIntConfig(dsda_config_identifier_t id, dboolean persist);
 int dsda_CycleConfig(dsda_config_identifier_t id, dboolean persist);
 int dsda_UpdateIntConfig(dsda_config_identifier_t id, int value, dboolean persist);
 const char* dsda_UpdateStringConfig(dsda_config_identifier_t id, const char* value, dboolean persist);
+const char* dsda_HackStringConfig(dsda_config_identifier_t id, const char* value, dboolean persist);
 int dsda_IntConfig(dsda_config_identifier_t id);
 int dsda_TransientIntConfig(dsda_config_identifier_t id);
 const char* dsda_StringConfig(dsda_config_identifier_t id);

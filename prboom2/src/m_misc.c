@@ -123,6 +123,7 @@ cfg_def_t cfg_defs[] =
   MIGRATED_SETTING(dsda_config_snd_midiplayer),
   MIGRATED_SETTING(dsda_config_snd_mididev),
   MIGRATED_SETTING(dsda_config_snd_soundfont),
+  MIGRATED_SETTING(dsda_config_snd_device),
   MIGRATED_SETTING(dsda_config_mus_fluidsynth_chorus),
   MIGRATED_SETTING(dsda_config_mus_fluidsynth_reverb),
   MIGRATED_SETTING(dsda_config_mus_fluidsynth_gain),
@@ -184,6 +185,7 @@ cfg_def_t cfg_defs[] =
 
   SETTING_HEADING("Mouse settings"),
   MIGRATED_SETTING(dsda_config_use_mouse),
+  MIGRATED_SETTING(dsda_config_mouse_menu_navigation),
   MIGRATED_SETTING(dsda_config_mouse_stutter_correction),
   MIGRATED_SETTING(dsda_config_mouse_sensitivity_horiz),
   MIGRATED_SETTING(dsda_config_fine_sensitivity),
